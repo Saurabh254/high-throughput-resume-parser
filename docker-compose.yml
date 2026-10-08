@@ -1,0 +1,107 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: ats-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: ats_parser_db
+      POSTGRES_USER: ats_user
+      POSTGRES_PASSWORD: ats_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./services/shared/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ats_user -d ats_parser_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: ats-redis
+    restart: always
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  ingestion-service:
+    build:
+      context: .
+      dockerfile: ./services/ingestion-service/Dockerfile
+    container_name: ats-ingestion
+    restart: always
+    ports:
+      - "8001:8001"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - LLM_PROVIDER=heuristic
+      - ORCHESTRATOR_URL=http://orchestrator-service:8002
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  orchestrator-service:
+    build:
+      context: .
+      dockerfile: ./services/orchestrator-service/Dockerfile
+    container_name: ats-orchestrator
+    restart: always
+    ports:
+      - "8002:8002"
+    environment:
+      - DATABASE_URL=postgresql://ats_user:ats_password@postgres:5432/ats_parser_db
+      - REDIS_URL=redis://redis:6379/0
+      - EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5
+      - RERANKER_MODEL_NAME=Xenova/ms-marco-MiniLM-L-6-v2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker-service:
+    build:
+      context: .
+      dockerfile: ./services/worker-service/Dockerfile
+    container_name: ats-worker
+    restart: always
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - INGESTION_SERVICE_URL=http://ingestion-service:8001
+      - ORCHESTRATOR_SERVICE_URL=http://orchestrator-service:8002
+    depends_on:
+      redis:
+        condition: service_healthy
+      orchestrator-service:
+        condition: service_started
+
+  frontend-gateway:
+    build:
+      context: ./frontend-gateway
+      dockerfile: Dockerfile
+    container_name: ats-frontend
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - INGESTION_SERVICE_URL=http://ingestion-service:8001
+      - ORCHESTRATOR_SERVICE_URL=http://orchestrator-service:8002
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - ingestion-service
+      - orchestrator-service
+
+volumes:
+  pgdata:
+  redisdata:
